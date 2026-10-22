@@ -57,6 +57,14 @@ cp .env.example .env
 Clients without it get a non-error PREVIEW; after the user approves, the call must be repeated with identical arguments plus `confirm: true`.
 A Claude Code `Elicitation` hook can auto-answer the dialog; do not configure one for `create_pr`.
 
+Some clients advertise elicitation but decline it without showing any dialog (seen in the Claude Code desktop app), so `create_pr` can never create a PR there.
+For those, force the preview flow with `BITBUCKET_CONFIRM_MODE=preview` in `.env` or in the server `env` config:
+
+| `BITBUCKET_CONFIRM_MODE` | Behavior                                                           |
+| ------------------------ | ------------------------------------------------------------------ |
+| `auto` (default)         | Dialog when the client advertises elicitation, preview otherwise   |
+| `preview`                | Always preview + `confirm: true`; the user approves in the chat    |
+
 ## Register in Claude Code
 
 In `~/.claude.json`:

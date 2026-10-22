@@ -14,6 +14,13 @@ if (!BITBUCKET_EMAIL || !BITBUCKET_API_TOKEN) {
   throw new Error('Missing BITBUCKET_EMAIL or BITBUCKET_API_TOKEN in .env');
 }
 
+// create_pr confirmation: "auto" uses a dialog when the client advertises elicitation; "preview" always
+// uses preview + confirm:true (for clients that advertise elicitation but never show the dialog)
+const CONFIRM_MODE = process.env.BITBUCKET_CONFIRM_MODE || 'auto';
+if (!['auto', 'preview'].includes(CONFIRM_MODE)) {
+  throw new Error(`Invalid BITBUCKET_CONFIRM_MODE "${CONFIRM_MODE}": use "auto" or "preview"`);
+}
+
 const auth = 'Basic ' + Buffer.from(`${BITBUCKET_EMAIL}:${BITBUCKET_API_TOKEN}`).toString('base64');
 
 // ── HTTP helpers ───────────────────────────────────────────────────────────
@@ -601,7 +608,7 @@ server.registerTool(
       include_default_reviewers: z.boolean().optional().default(true).describe('Add the repo effective default reviewers, like the web UI (default true)'),
       close_source_branch: z.boolean().optional().default(true).describe('Delete source branch after merge (default true; the user confirms it)'),
       draft:              z.boolean().optional().default(false).describe('Create as draft (default false)'),
-      confirm:            z.boolean().optional().default(false).describe('Only for clients WITHOUT confirmation dialogs: set true after the user approved the preview. Ignored when the client supports dialogs (the dialog always runs).'),
+      confirm:            z.boolean().optional().default(false).describe('Only when the tool returned a PREVIEW: set true after the user approved it. Ignored when a confirmation dialog is used.'),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
@@ -667,7 +674,7 @@ server.registerTool(
 
     // Confirmation: the only way past here is an accepted dialog or confirm:true on a dialog-less client
     let csb = close_source_branch, drf = draft, via;
-    if (server.server.getClientCapabilities()?.elicitation?.form) {
+    if (CONFIRM_MODE === 'auto' && server.server.getClientCapabilities()?.elicitation?.form) {
       let res;
       try {
         res = await server.server.elicitInput({
@@ -684,8 +691,10 @@ server.registerTool(
       } catch (e) {
         throw new Error(`Confirmation failed (${e.message}); PR not created.`);
       }
-      if (res.action === 'decline') return { content: [{ type: 'text', text: 'PR not created: the user declined.' }] };
-      if (res.action === 'cancel') return { content: [{ type: 'text', text: 'PR not created: the user cancelled the confirmation.' }] };
+      // Some clients advertise elicitation but auto-decline without showing anything
+      const noDialogHint = ' If no confirmation dialog was shown, set BITBUCKET_CONFIRM_MODE=preview in this MCP server config.';
+      if (res.action === 'decline') return { content: [{ type: 'text', text: 'PR not created: the user declined.' + noDialogHint }] };
+      if (res.action === 'cancel') return { content: [{ type: 'text', text: 'PR not created: the user cancelled the confirmation.' + noDialogHint }] };
       // Unknown action or missing values fail closed (SDK validates content only when present)
       if (res.action !== 'accept' || typeof res.content?.close_source_branch !== 'boolean' || typeof res.content?.draft !== 'boolean') {
         throw new Error('Confirmation failed (dialog returned no values); PR not created.');
@@ -696,7 +705,7 @@ server.registerTool(
     } else {
       if (!confirm) {
         const preview = [
-          'PREVIEW — PR NOT created (this client cannot show a confirmation dialog).',
+          `PREVIEW — PR NOT created (${CONFIRM_MODE === 'preview' ? 'BITBUCKET_CONFIRM_MODE=preview' : 'this client cannot show a confirmation dialog'}).`,
           ...summary,
           `Draft: ${draft ? 'yes' : 'no'}`,
           `Close source branch after merge: ${close_source_branch ? 'yes' : 'no'}`,
