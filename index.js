@@ -33,9 +33,11 @@ async function parseResponse(res) {
   }
 }
 
+const REVIEW_400_MSG = 'HTTP 400: Bad Request. Note — you cannot approve or request changes on a PR you authored.';
+
 function toError(status, data, text) {
   if (status === 400 && (!text || text.trim() === 'Bad Request')) {
-    return new Error('HTTP 400: Bad Request. Note — you cannot approve or request changes on a PR you authored.');
+    return new Error(REVIEW_400_MSG);
   }
   return new Error(data?.error?.message ?? text ?? `HTTP ${status}`);
 }
@@ -82,6 +84,7 @@ const PR_LIST_FIELDS = [
 const UUID_RE = /^(\{[0-9a-f-]{36}\}|[0-9a-f-]{36})$/i;
 const ACCOUNT_ID_RE = /^(\d+:[0-9a-fA-F-]{36}|[0-9a-fA-F]{24})$/;
 const USER_REF_MSG = 'use "me", a {uuid}, a bare uuid, or an account_id (display names are not supported)';
+const REVIEWER_REF_MSG = 'use a {uuid}, a bare uuid, or an account_id ("me" is not allowed: the author cannot review their own PR; display names are not supported)';
 const REVIEW_MARKER = { approved: '✓ approved', changes_requested: '✗ changes requested', pending: '○ pending' };
 
 // "me" | {uuid} | bare uuid | account_id → { kind, value } or null (allow-list, nothing else passes)
@@ -575,6 +578,165 @@ server.registerTool(
     }
     // The review_status header already carries the pagination hint
     if (data.next && review_status === 'any') lines.push(`\n→ More results available. Use page=${page + 1} to continue.`);
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
+  }
+);
+
+// ── 17. Create PR ──────────────────────────────────────────────────────────
+// Fail-closed: every step before the single POST may return/throw; nothing is created unless a human accepted.
+const CREATE_400_MSG = 'HTTP 400: PR not created. Check that the source branch exists on the remote, it has changes to merge, there is no open PR for the same source → destination, and the reviewers are valid.';
+
+server.registerTool(
+  'create_pr',
+  {
+    description: 'Creates a Pull Request in ONE repository (source branch must already exist on the remote). Adds the repository effective default reviewers like the web UI. ALWAYS asks the user to confirm the whole PR first: a dialog when the client supports it, otherwise a preview that must be approved and re-sent with confirm: true.',
+    inputSchema: {
+      workspace:          z.string().describe('Bitbucket workspace slug'),
+      repo:               z.string().describe('Repository slug'),
+      title:              z.string().min(1).describe('PR title'),
+      source_branch:      z.string().min(1).describe('Existing remote branch to merge from (same repo)'),
+      destination_branch: z.string().min(1).optional().describe('Target branch (default: repository main branch)'),
+      description:        z.string().optional().describe('PR description (markdown)'),
+      reviewers:          z.array(z.string().refine(v => { const r = parseUserRef(v); return r !== null && r.kind !== 'me'; }, REVIEWER_REF_MSG)).optional().default([]).describe('{uuid}, bare uuid or account_id of reviewers'),
+      include_default_reviewers: z.boolean().optional().default(true).describe('Add the repo effective default reviewers, like the web UI (default true)'),
+      close_source_branch: z.boolean().optional().default(true).describe('Delete source branch after merge (default true; the user confirms it)'),
+      draft:              z.boolean().optional().default(false).describe('Create as draft (default false)'),
+      confirm:            z.boolean().optional().default(false).describe('Only for clients WITHOUT confirmation dialogs: set true after the user approved the preview. Ignored when the client supports dialogs (the dialog always runs).'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  },
+  async ({ workspace, repo, title, source_branch, destination_branch, description, reviewers, include_default_reviewers, close_source_branch, draft, confirm }, extra) => {
+    const base = repoPath(workspace, repo);
+    const warnings = [];
+    // First network call, unwrapped: auth errors surface as-is
+    const me = (reviewers.length || include_default_reviewers) ? await resolveMeUuid() : null;
+
+    // Explicit reviewers: one GET per distinct parsed value (resolves uuid, checks existence, gets display name)
+    const refs = new Map();
+    for (const input of reviewers) {
+      const { value } = parseUserRef(input);
+      if (!refs.has(value)) refs.set(value, input);
+    }
+    const explicit = await Promise.all([...refs].map(async ([value, input]) => {
+      try {
+        const u = await bbRequest('GET', `/users/${encodeURIComponent(value)}?fields=uuid,display_name`);
+        if (!UUID_RE.test(u?.uuid ?? '')) throw new Error('no uuid in response');
+        return { uuid: u.uuid.toLowerCase(), name: u.display_name ?? u.uuid };
+      } catch (e) {
+        throw new Error(`Reviewer "${oneLine(input)}" not found in Bitbucket (or could not be fetched: ${oneLine(e.message)}). PR not created.`);
+      }
+    }));
+
+    // Default reviewers: a failure is a warning, not an error
+    let defaults = [];
+    if (include_default_reviewers) {
+      try {
+        const data = await bbRequest('GET', `${base}/effective-default-reviewers?pagelen=100&fields=values.user.uuid,values.user.display_name,next`);
+        if (data?.next) warnings.push('⚠ More than 100 default reviewers; only the first 100 were added.');
+        defaults = (data?.values ?? []).filter(v => UUID_RE.test(v.user?.uuid ?? ''));
+      } catch (e) {
+        warnings.push(`⚠ Default reviewers not added: could not fetch effective default reviewers (${oneLine(e.message)}).`);
+      }
+    }
+
+    // Merge: explicit first, then defaults; the author is never a reviewer (explicit self warns, default self is silent)
+    const picked = new Map();
+    for (const { uuid, name } of explicit) if (!picked.has(uuid)) picked.set(uuid, { name, isDefault: false });
+    for (const v of defaults) {
+      const uuid = v.user.uuid.toLowerCase();
+      if (!picked.has(uuid)) picked.set(uuid, { name: v.user.display_name ?? v.user.uuid, isDefault: true });
+    }
+    if (me && picked.has(me)) {
+      if (!picked.get(me).isDefault) warnings.push('⚠ You were removed from reviewers: the author cannot review their own PR.');
+      picked.delete(me);
+    }
+
+    let descLine = 'none';
+    if (description) {
+      const first = description.split(/\r?\n/)[0];
+      descLine = `${oneLine(first.length > 120 ? first.slice(0, 120) + '…' : first)} (${description.length} chars)`;
+    }
+    const summary = [
+      `Create pull request in ${oneLine(workspace)}/${oneLine(repo)}?`,
+      `Title: ${oneLine(title)}`,
+      `Branch: ${oneLine(source_branch)} → ${destination_branch ? oneLine(destination_branch) : 'repository main branch (resolved by Bitbucket)'}`,
+      `Reviewers (${picked.size}): ${picked.size ? [...picked.values()].map(r => oneLine(r.name) + (r.isDefault ? ' (default)' : '')).join(', ') : 'none'}`,
+      `Description: ${descLine}`,
+      ...warnings,
+    ];
+
+    // Confirmation: the only way past here is an accepted dialog or confirm:true on a dialog-less client
+    let csb = close_source_branch, drf = draft, via;
+    if (server.server.getClientCapabilities()?.elicitation?.form) {
+      let res;
+      try {
+        res = await server.server.elicitInput({
+          message: summary.join('\n'),
+          requestedSchema: {
+            type: 'object',
+            properties: {
+              close_source_branch: { type: 'boolean', title: 'Close source branch after merge', default: close_source_branch },
+              draft:               { type: 'boolean', title: 'Create as draft', default: draft },
+            },
+            required: ['close_source_branch', 'draft'],
+          },
+        }, { timeout: 300000, signal: extra.signal });
+      } catch (e) {
+        throw new Error(`Confirmation failed (${e.message}); PR not created.`);
+      }
+      if (res.action === 'decline') return { content: [{ type: 'text', text: 'PR not created: the user declined.' }] };
+      if (res.action === 'cancel') return { content: [{ type: 'text', text: 'PR not created: the user cancelled the confirmation.' }] };
+      // Unknown action or missing values fail closed (SDK validates content only when present)
+      if (res.action !== 'accept' || typeof res.content?.close_source_branch !== 'boolean' || typeof res.content?.draft !== 'boolean') {
+        throw new Error('Confirmation failed (dialog returned no values); PR not created.');
+      }
+      csb = res.content.close_source_branch;
+      drf = res.content.draft;
+      via = 'dialog';
+    } else {
+      if (!confirm) {
+        const preview = [
+          'PREVIEW — PR NOT created (this client cannot show a confirmation dialog).',
+          ...summary,
+          `Draft: ${draft ? 'yes' : 'no'}`,
+          `Close source branch after merge: ${close_source_branch ? 'yes' : 'no'}`,
+          'Ask the user to confirm this PR, including draft and close_source_branch, then call create_pr again with identical arguments and confirm: true.',
+        ];
+        return { content: [{ type: 'text', text: preview.join('\n') }] };
+      }
+      via = 'confirm:true';
+    }
+
+    if (extra.signal?.aborted) throw new Error('Request cancelled; PR not created.');
+
+    const body = {
+      title,
+      source: { branch: { name: source_branch } },
+      ...(destination_branch && { destination: { branch: { name: destination_branch } } }),
+      ...(description && { description }),
+      reviewers: [...picked.keys()].map(uuid => ({ uuid })),
+      close_source_branch: csb,
+      draft: drf,
+    };
+    let pr;
+    try {
+      pr = await bbRequest('POST', `${base}/pullrequests`, body);
+    } catch (e) {
+      if (e.message === REVIEW_400_MSG) throw new Error(CREATE_400_MSG);
+      throw e;
+    }
+
+    const names = (pr.reviewers ?? []).map(r => oneLine(r.display_name ?? r.uuid ?? '?'));
+    const lines = [
+      `✓ PR #${pr.id} created: ${oneLine(pr.title ?? title)}`,
+      `Branch: ${oneLine(pr.source?.branch?.name ?? '?')} → ${oneLine(pr.destination?.branch?.name ?? '?')}`,
+      `Draft: ${pr.draft ? 'yes' : 'no'}`,
+      `Close source branch: ${pr.close_source_branch ? 'yes' : 'no'}`,
+      `Reviewers (${names.length}): ${names.join(', ') || 'none'}`,
+      `Confirmed via: ${via}`,
+      `URL: ${pr.links?.html?.href ?? '?'}`,
+      ...warnings,
+    ];
     return { content: [{ type: 'text', text: lines.join('\n') }] };
   }
 );

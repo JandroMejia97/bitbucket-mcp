@@ -30,6 +30,7 @@ cp .env.example .env
 
 | Tool                     | Description                                                                          |
 | ------------------------ | ------------------------------------------------------------------------------------ |
+| `create_pr`              | Opens a PR (adds effective default reviewers); always confirmed by the user first    |
 | `list_prs`               | Lists a repo's PRs by state/reviewer/author; `review_status` filters current page only |
 | `submit_review`          | Posts all comments + sets verdict in one call (best for AI reviews)                  |
 | `approve_pr`             | Approves the PR                                                                      |
@@ -49,6 +50,12 @@ cp .env.example .env
 > **Note:** The Bitbucket Cloud API does not expose a "pending comments" endpoint
 > (unlike GitHub's draft reviews). `submit_review` approximates this by posting
 > all comments in quick succession before setting the verdict.
+
+### Creating PRs
+
+`create_pr` never creates a PR without the user seeing it first. If the client supports form elicitation, a dialog shows the title, branches, reviewers (default ones tagged) and warnings, and the user can toggle `close_source_branch` and `draft` there.
+Clients without it get a non-error PREVIEW; after the user approves, the call must be repeated with identical arguments plus `confirm: true`.
+A Claude Code `Elicitation` hook can auto-answer the dialog; do not configure one for `create_pr`.
 
 ## Register in Claude Code
 
@@ -107,9 +114,9 @@ Create it as an **API token with scopes**, app **Bitbucket**, with these scopes:
 
 | Scope                         | Used by                                                                        |
 | ----------------------------- | ------------------------------------------------------------------------------ |
-| `read:pullrequest:bitbucket`  | `list_prs`, `get_pr_status`, `list_pr_comments`, `get_pr_comment`             |
-| `write:pullrequest:bitbucket` | Comments (create/edit/delete/resolve), approvals, change requests, `submit_review` |
-| `read:user:bitbucket`         | `GET /user` to resolve `"me"` in `list_prs` (`reviewer`/`author`)              |
+| `read:pullrequest:bitbucket`  | `list_prs`, `get_pr_status`, `list_pr_comments`, `get_pr_comment`, `create_pr` (default reviewers) |
+| `write:pullrequest:bitbucket` | Comments (create/edit/delete/resolve), approvals, change requests, `submit_review`, `create_pr` |
+| `read:user:bitbucket`         | `GET /user` to resolve `"me"` in `list_prs` and exclude the author in `create_pr`; `GET /users/{id}` for `create_pr` reviewers |
 
 No other scopes are needed (`read:workspace` and `read:repository` are not used).
 
