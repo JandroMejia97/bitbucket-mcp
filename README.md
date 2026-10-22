@@ -41,7 +41,7 @@ cp .env.example .env
 ### Recommended flow for AI code reviews
 
 ```text
-0. list_prs           → reviewer=me review_status=pending → pick pr_id
+0. list_prs           → review_status=pending (reviewer defaults to me, drafts hidden) → pick pr_id
 1. get_pr_status      → check current state and reviewers
 2. submit_review      → post all inline comments + summary + verdict atomically
 ```

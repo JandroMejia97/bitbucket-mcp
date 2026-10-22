@@ -83,8 +83,17 @@ function parseUserRef(v) {
   if (typeof v !== 'string') return null;
   if (v === 'me') return { kind: 'me' };
   if (UUID_RE.test(v)) return { kind: 'uuid', value: '{' + v.replace(/^\{|\}$/g, '').toLowerCase() + '}' };
-  if (ACCOUNT_ID_RE.test(v)) return { kind: 'account_id', value: v };
+  if (ACCOUNT_ID_RE.test(v)) return { kind: 'account_id', value: v.toLowerCase() };
   return null;
+}
+
+// The token's identity is fixed for the process lifetime: resolve "me" once
+let meUuid;
+async function resolveMeUuid() {
+  if (meUuid) return meUuid;
+  const me = await bbRequest('GET', '/user');
+  if (!UUID_RE.test(me?.uuid ?? '')) throw new Error('Could not resolve "me": /user returned no uuid');
+  return (meUuid = me.uuid.toLowerCase());
 }
 
 // Invariant: every interpolated value comes from a zod enum or parseUserRef's allow-list; no " or \ can reach q.
@@ -498,30 +507,30 @@ server.registerTool(
 server.registerTool(
   'list_prs',
   {
-    description: 'Lists Pull Requests of ONE repository filtered by state, reviewer, author and review status. Returns id, title, author, branches, last update and reviewer statuses. The reviewer filter includes PRs the reviewer already approved; use review_status to narrow. review_status filters ONLY the current page (no auto-pagination).',
+    description: 'Lists Pull Requests of ONE repository filtered by state, reviewer, author and review status. Returns id, title, author, branches, last update and reviewer statuses. The reviewer filter includes PRs the reviewer already approved; use review_status to narrow (defaults reviewer to "me"). review_status and draft hiding filter ONLY the current page (no auto-pagination).',
     inputSchema: {
       workspace:     z.string().describe('Bitbucket workspace slug'),
       repo:          z.string().describe('Repository slug'),
       state:         z.array(z.enum(['OPEN', 'MERGED', 'DECLINED', 'SUPERSEDED'])).min(1).optional().default(['OPEN']).describe('PR states (default ["OPEN"])'),
       reviewer:      z.string().refine(v => parseUserRef(v) !== null, USER_REF_MSG).optional().describe('"me", {uuid}, bare uuid or account_id of an assigned reviewer'),
       author:        z.string().refine(v => parseUserRef(v) !== null, USER_REF_MSG).optional().describe('"me", {uuid}, bare uuid or account_id of the PR author'),
-      review_status: z.enum(['any', 'pending', 'approved', 'changes_requested']).optional().default('any').describe('Reviewer status filter on the current page; requires reviewer'),
+      review_status: z.enum(['any', 'pending', 'approved', 'changes_requested']).optional().default('any').describe('Reviewer status filter on the current page; implies reviewer="me" when reviewer is omitted'),
+      include_drafts: z.boolean().optional().describe('Show draft PRs (default: hidden only for reviewer="me" with review_status="pending", shown otherwise)'),
       sort:          z.enum(['-updated_on', 'updated_on', '-created_on', 'created_on']).optional().default('-updated_on').describe('Sort order (default -updated_on)'),
       page:          z.number().int().positive().optional().default(1).describe('Page number (default 1)'),
       pagelen:       z.number().int().min(1).max(50).optional().default(20).describe('Results per page (max 50)'),
     },
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  async ({ workspace, repo, state, reviewer, author, review_status, sort, page, pagelen }) => {
-    // Cross-field check lives here: a refined top-level schema makes SDK 1.29 publish an empty one
-    if (review_status !== 'any' && !reviewer) throw new Error('review_status requires reviewer (pass reviewer="me" or a uuid/account_id).');
+  async ({ workspace, repo, state, reviewer, author, review_status, include_drafts, sort, page, pagelen }) => {
+    // Cross-field default lives here: a refined top-level schema makes SDK 1.29 publish an empty one
+    if (review_status !== 'any' && !reviewer) reviewer = 'me';
+    const hideDrafts = include_drafts === undefined ? reviewer === 'me' && review_status === 'pending' : !include_drafts;
 
     let rRef = reviewer ? parseUserRef(reviewer) : null;
     let aRef = author ? parseUserRef(author) : null;
     if (rRef?.kind === 'me' || aRef?.kind === 'me') {
-      const me = await bbRequest('GET', '/user');
-      if (!UUID_RE.test(me?.uuid ?? '')) throw new Error('Could not resolve "me": /user returned no uuid');
-      const meRef = { kind: 'uuid', value: me.uuid.toLowerCase() };
+      const meRef = { kind: 'uuid', value: await resolveMeUuid() };
       if (rRef?.kind === 'me') rRef = meRef;
       if (aRef?.kind === 'me') aRef = meRef;
     }
@@ -539,14 +548,17 @@ server.registerTool(
 
     // Missing target participant (incl. empty/null participants) counts as pending
     const reviewersOf = pr => (pr.participants ?? []).filter(p => p.role === 'REVIEWER');
-    const isTarget = p => rRef.kind === 'account_id' ? p.user?.account_id === rRef.value : p.user?.uuid?.toLowerCase() === rRef.value;
+    const isTarget = p => rRef.kind === 'account_id' ? p.user?.account_id?.toLowerCase() === rRef.value : p.user?.uuid?.toLowerCase() === rRef.value;
     const targetStatus = pr => reviewStatusOf(reviewersOf(pr).find(isTarget));
 
-    const shown = review_status !== 'any' ? values.filter(pr => targetStatus(pr) === review_status) : values;
+    const visible = hideDrafts ? values.filter(pr => !pr.draft) : values;
+    const draftsHidden = K - visible.length;
+    const draftsText = draftsHidden ? ` — ${draftsHidden} draft(s) hidden (include_drafts=true to show)` : '';
+    const shown = review_status !== 'any' ? visible.filter(pr => targetStatus(pr) === review_status) : visible;
     const lines = [
       review_status === 'any'
-        ? `${data.size ?? K} PR(s) total — page ${page} — filters: ${filtersText}`
-        : `${shown.length} of ${K} on page ${page} matched review_status=${review_status}` + (data.next ? ` — more pages available (page=${page + 1})` : ' — last page'),
+        ? `${data.size ?? K} PR(s) total — page ${page} — filters: ${filtersText}${draftsText}`
+        : `${shown.length} of ${K} on page ${page} matched review_status=${review_status}${draftsText}` + (data.next ? ` — more pages available (page=${page + 1})` : ' — last page'),
     ];
     for (const pr of shown) {
       const draft = pr.draft ? ' [draft]' : '';
@@ -555,7 +567,8 @@ server.registerTool(
       const reviewers = reviewersOf(pr).map(p => `${REVIEW_MARKER[reviewStatusOf(p)]} @${p.user?.display_name ?? '?'}`);
       lines.push(`  reviewers: ${reviewers.length ? reviewers.join(' · ') : 'none assigned'}`);
     }
-    if (data.next) lines.push(`\n→ More results available. Use page=${page + 1} to continue.`);
+    // The review_status header already carries the pagination hint
+    if (data.next && review_status === 'any') lines.push(`\n→ More results available. Use page=${page + 1} to continue.`);
     return { content: [{ type: 'text', text: lines.join('\n') }] };
   }
 );
