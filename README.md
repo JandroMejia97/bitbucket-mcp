@@ -30,7 +30,7 @@ cp .env.example .env
 
 | Tool                     | Description                                                                          |
 | ------------------------ | ------------------------------------------------------------------------------------ |
-| `create_pr`              | Opens a PR (adds effective default reviewers); always confirmed by the user first    |
+| `create_pr`              | Opens a PR (adds default reviewers, refuses duplicates); dialog or preview + token   |
 | `list_prs`               | Lists a repo's PRs by state/reviewer/author; `review_status` filters current page only |
 | `submit_review`          | Posts all comments + sets verdict in one call (best for AI reviews)                  |
 | `approve_pr`             | Approves the PR                                                                      |
@@ -53,8 +53,14 @@ cp .env.example .env
 
 ### Creating PRs
 
-`create_pr` never creates a PR without the user seeing it first. If the client supports form elicitation, a dialog shows the title, branches, reviewers (default ones tagged) and warnings, and the user can toggle `close_source_branch` and `draft` there.
-Clients without it get a non-error PREVIEW; after the user approves, the call must be repeated with identical arguments plus `confirm: true`.
+Before any confirmation, `create_pr` checks for an OPEN PR from the same source branch (and the same destination, when one is given) and refuses if it finds one. If that lookup fails, no PR is created.
+
+The user then sees a summary: title, branches, reviewers (default ones tagged), the description (the first 2000 characters, each line prefixed with `| `, plus a count of any characters not shown), draft, close source branch and warnings. How it is shown depends on the client:
+
+- **Dialog** (the client supports form elicitation): the summary appears in a confirmation dialog, where the user can also toggle `close_source_branch` and `draft`. Only an accepted dialog creates the PR.
+- **Preview** (no elicitation, or `BITBUCKET_CONFIRM_MODE=preview`): the tool returns a non-error PREVIEW with a `confirm_token`. The PR is created only when the call is repeated with identical arguments plus that token. The token is an HMAC of the final PR body (including the resolved reviewers) with a per-process secret. If anything changed since the preview, or the token is invalid, the tool returns a new preview instead of creating the PR.
+
+In preview mode the model relays the preview to the user. The token proves that nothing changed since the preview. It does NOT prove that the user saw or approved it: a model could skip asking. This is an accepted risk; use the dialog flow when your client really shows it.
 A Claude Code `Elicitation` hook can auto-answer the dialog; do not configure one for `create_pr`.
 
 Some clients advertise elicitation but decline it without showing any dialog (seen in the Claude Code desktop app), so `create_pr` can never create a PR there.
@@ -63,7 +69,15 @@ For those, force the preview flow with `BITBUCKET_CONFIRM_MODE=preview` in `.env
 | `BITBUCKET_CONFIRM_MODE` | Behavior                                                           |
 | ------------------------ | ------------------------------------------------------------------ |
 | `auto` (default)         | Dialog when the client advertises elicitation, preview otherwise   |
-| `preview`                | Always preview + `confirm: true`; the user approves in the chat    |
+| `preview`                | Always preview + `confirm_token`; the user approves in the chat    |
+
+## Tests
+
+```bash
+npm test
+```
+
+Runs `node --test` with an in-memory MCP client and a stubbed `fetch`: no network, no real credentials.
 
 ## Register in Claude Code
 
@@ -122,7 +136,7 @@ Create it as an **API token with scopes**, app **Bitbucket**, with these scopes:
 
 | Scope                         | Used by                                                                        |
 | ----------------------------- | ------------------------------------------------------------------------------ |
-| `read:pullrequest:bitbucket`  | `list_prs`, `get_pr_status`, `list_pr_comments`, `get_pr_comment`, `create_pr` (default reviewers) |
+| `read:pullrequest:bitbucket`  | `list_prs`, `get_pr_status`, `list_pr_comments`, `get_pr_comment`, `create_pr` (default reviewers, open-PR check) |
 | `write:pullrequest:bitbucket` | Comments (create/edit/delete/resolve), approvals, change requests, `submit_review`, `create_pr` |
 | `read:user:bitbucket`         | `GET /user` to resolve `"me"` in `list_prs` and exclude the author in `create_pr`; `GET /users/{id}` for `create_pr` reviewers |
 
