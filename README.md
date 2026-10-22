@@ -28,18 +28,20 @@ cp .env.example .env
 
 ### Review & approval
 
-| Tool                     | Description                                                         |
-| ------------------------ | ------------------------------------------------------------------- |
-| `submit_review`          | Posts all comments + sets verdict in one call (best for AI reviews) |
-| `approve_pr`             | Approves the PR                                                     |
-| `remove_pr_approval`     | Removes a previously submitted approval                             |
-| `request_changes`        | Marks the PR as needing changes (blocks merge)                      |
-| `remove_changes_request` | Removes the changes_requested status                                |
-| `get_pr_status`          | PR summary: state, author, reviewers, approval status               |
+| Tool                     | Description                                                                          |
+| ------------------------ | ------------------------------------------------------------------------------------ |
+| `list_prs`               | Lists a repo's PRs by state/reviewer/author; `review_status` filters current page only |
+| `submit_review`          | Posts all comments + sets verdict in one call (best for AI reviews)                  |
+| `approve_pr`             | Approves the PR                                                                      |
+| `remove_pr_approval`     | Removes a previously submitted approval                                              |
+| `request_changes`        | Marks the PR as needing changes (blocks merge)                                       |
+| `remove_changes_request` | Removes the changes_requested status                                                 |
+| `get_pr_status`          | PR summary: state, author, reviewers, approval status                                |
 
 ### Recommended flow for AI code reviews
 
 ```text
+0. list_prs           → reviewer=me review_status=pending → pick pr_id
 1. get_pr_status      → check current state and reviewers
 2. submit_review      → post all inline comments + summary + verdict atomically
 ```

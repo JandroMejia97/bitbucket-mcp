@@ -63,6 +63,40 @@ async function bbRequestRaw(method, path, body) {
   return data;
 }
 
+// ── PR helpers ─────────────────────────────────────────────────────────────
+
+const PR_LIST_FIELDS = [
+  'values.id', 'values.title', 'values.state', 'values.draft', 'values.updated_on',
+  'values.author.display_name', 'values.source.branch.name', 'values.destination.branch.name',
+  'values.participants.role', 'values.participants.approved', 'values.participants.state',
+  'values.participants.user.display_name', 'values.participants.user.uuid', 'values.participants.user.account_id',
+  'page', 'pagelen', 'size', 'next',
+].join(',');
+
+const UUID_RE = /^(\{[0-9a-f-]{36}\}|[0-9a-f-]{36})$/i;
+const ACCOUNT_ID_RE = /^(\d+:[0-9a-fA-F-]{36}|[0-9a-fA-F]{24})$/;
+const USER_REF_MSG = 'use "me", a {uuid}, a bare uuid, or an account_id (display names are not supported)';
+const REVIEW_MARKER = { approved: '✓ approved', changes_requested: '✗ changes requested', pending: '○ pending' };
+
+// "me" | {uuid} | bare uuid | account_id → { kind, value } or null (allow-list, nothing else passes)
+function parseUserRef(v) {
+  if (typeof v !== 'string') return null;
+  if (v === 'me') return { kind: 'me' };
+  if (UUID_RE.test(v)) return { kind: 'uuid', value: '{' + v.replace(/^\{|\}$/g, '').toLowerCase() + '}' };
+  if (ACCOUNT_ID_RE.test(v)) return { kind: 'account_id', value: v };
+  return null;
+}
+
+// Invariant: every interpolated value comes from a zod enum or parseUserRef's allow-list; no " or \ can reach q.
+function buildPrQuery(states, reviewerRef, authorRef) {
+  let q = '(' + states.map(s => `state="${s}"`).join(' OR ') + ')';
+  if (reviewerRef) q += ` AND reviewers.${reviewerRef.kind}="${reviewerRef.value}"`;
+  if (authorRef) q += ` AND author.${authorRef.kind}="${authorRef.value}"`;
+  return q;
+}
+
+const reviewStatusOf = p => p?.approved ? 'approved' : p?.state === 'changes_requested' ? 'changes_requested' : 'pending';
+
 // ── Server ─────────────────────────────────────────────────────────────────
 
 const server = new McpServer({ name: 'bitbucket-pr-comments', version: '1.0.0' });
@@ -443,8 +477,7 @@ server.registerTool(
       .filter(p => p.role === 'REVIEWER')
       .map(p => {
         const name  = p.user?.display_name ?? '?';
-        const state = p.approved ? '✓ approved' : p.state === 'changes_requested' ? '✗ changes requested' : '○ pending';
-        return `  ${state} — @${name}`;
+        return `  ${REVIEW_MARKER[reviewStatusOf(p)]} — @${name}`;
       });
     const lines = [
       `PR #${pr_id}: ${pr.title}`,
@@ -457,6 +490,72 @@ server.registerTool(
       `Reviewers (${reviewers.length}):`,
       ...(reviewers.length ? reviewers : ['  none assigned']),
     ];
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
+  }
+);
+
+// ── 16. List PRs ───────────────────────────────────────────────────────────
+server.registerTool(
+  'list_prs',
+  {
+    description: 'Lists Pull Requests of ONE repository filtered by state, reviewer, author and review status. Returns id, title, author, branches, last update and reviewer statuses. The reviewer filter includes PRs the reviewer already approved; use review_status to narrow. review_status filters ONLY the current page (no auto-pagination).',
+    inputSchema: {
+      workspace:     z.string().describe('Bitbucket workspace slug'),
+      repo:          z.string().describe('Repository slug'),
+      state:         z.array(z.enum(['OPEN', 'MERGED', 'DECLINED', 'SUPERSEDED'])).min(1).optional().default(['OPEN']).describe('PR states (default ["OPEN"])'),
+      reviewer:      z.string().refine(v => parseUserRef(v) !== null, USER_REF_MSG).optional().describe('"me", {uuid}, bare uuid or account_id of an assigned reviewer'),
+      author:        z.string().refine(v => parseUserRef(v) !== null, USER_REF_MSG).optional().describe('"me", {uuid}, bare uuid or account_id of the PR author'),
+      review_status: z.enum(['any', 'pending', 'approved', 'changes_requested']).optional().default('any').describe('Reviewer status filter on the current page; requires reviewer'),
+      sort:          z.enum(['-updated_on', 'updated_on', '-created_on', 'created_on']).optional().default('-updated_on').describe('Sort order (default -updated_on)'),
+      page:          z.number().int().positive().optional().default(1).describe('Page number (default 1)'),
+      pagelen:       z.number().int().min(1).max(50).optional().default(20).describe('Results per page (max 50)'),
+    },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  },
+  async ({ workspace, repo, state, reviewer, author, review_status, sort, page, pagelen }) => {
+    // Cross-field check lives here: a refined top-level schema makes SDK 1.29 publish an empty one
+    if (review_status !== 'any' && !reviewer) throw new Error('review_status requires reviewer (pass reviewer="me" or a uuid/account_id).');
+
+    let rRef = reviewer ? parseUserRef(reviewer) : null;
+    let aRef = author ? parseUserRef(author) : null;
+    if (rRef?.kind === 'me' || aRef?.kind === 'me') {
+      const me = await bbRequest('GET', '/user');
+      if (!UUID_RE.test(me?.uuid ?? '')) throw new Error('Could not resolve "me": /user returned no uuid');
+      const meRef = { kind: 'uuid', value: me.uuid.toLowerCase() };
+      if (rRef?.kind === 'me') rRef = meRef;
+      if (aRef?.kind === 'me') aRef = meRef;
+    }
+
+    const qs = new URLSearchParams({ q: buildPrQuery(state, rRef, aRef), sort, fields: PR_LIST_FIELDS, page: String(page), pagelen: String(pagelen) });
+    const data = await bbRequest('GET', `/repositories/${workspace}/${repo}/pullrequests?${qs}`);
+
+    const values = data.values ?? [];
+    const K = values.length;
+    const filtersText = `state=[${state.join(',')}]` + (reviewer ? `, reviewer=${reviewer}` : '') + (author ? `, author=${author}` : '');
+    if (K === 0) {
+      const pageHint = page > 1 ? ` Page ${page} is empty — it may be past the last page; try page=1.` : '';
+      return { content: [{ type: 'text', text: `No PRs found in ${workspace}/${repo} for ${filtersText}.${pageHint}` }] };
+    }
+
+    // Missing target participant (incl. empty/null participants) counts as pending
+    const reviewersOf = pr => (pr.participants ?? []).filter(p => p.role === 'REVIEWER');
+    const isTarget = p => rRef.kind === 'account_id' ? p.user?.account_id === rRef.value : p.user?.uuid?.toLowerCase() === rRef.value;
+    const targetStatus = pr => reviewStatusOf(reviewersOf(pr).find(isTarget));
+
+    const shown = review_status !== 'any' ? values.filter(pr => targetStatus(pr) === review_status) : values;
+    const lines = [
+      review_status === 'any'
+        ? `${data.size ?? K} PR(s) total — page ${page} — filters: ${filtersText}`
+        : `${shown.length} of ${K} on page ${page} matched review_status=${review_status}` + (data.next ? ` — more pages available (page=${page + 1})` : ' — last page'),
+    ];
+    for (const pr of shown) {
+      const draft = pr.draft ? ' [draft]' : '';
+      lines.push(`\n#${pr.id}${draft} ${pr.title} — @${pr.author?.display_name ?? '?'} — ${pr.state} — ${pr.source?.branch?.name ?? '?'} → ${pr.destination?.branch?.name ?? '?'} — updated ${pr.updated_on?.slice(0, 10) ?? '?'}`);
+      if (reviewer) lines.push(`  ${reviewer === 'me' ? 'you' : 'reviewer'}: ${REVIEW_MARKER[targetStatus(pr)]}`);
+      const reviewers = reviewersOf(pr).map(p => `${REVIEW_MARKER[reviewStatusOf(p)]} @${p.user?.display_name ?? '?'}`);
+      lines.push(`  reviewers: ${reviewers.length ? reviewers.join(' · ') : 'none assigned'}`);
+    }
+    if (data.next) lines.push(`\n→ More results available. Use page=${page + 1} to continue.`);
     return { content: [{ type: 'text', text: lines.join('\n') }] };
   }
 );
