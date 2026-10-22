@@ -63,6 +63,12 @@ async function bbRequestRaw(method, path, body) {
   return data;
 }
 
+// Encode slugs so a "?", "#" or "/" in user input cannot rewrite the request path
+const repoPath = (workspace, repo) => `/repositories/${encodeURIComponent(workspace)}/${encodeURIComponent(repo)}`;
+
+// Collapse line breaks in user-controlled text (titles, names) so one item cannot fake extra output lines
+const oneLine = v => String(v).replace(/[\r\n]+/g, ' ');
+
 // ── PR helpers ─────────────────────────────────────────────────────────────
 
 const PR_LIST_FIELDS = [
@@ -127,7 +133,7 @@ server.registerTool(
   async ({ workspace, repo, pr_id, content, file_path, line }) => {
     const body = { content: { raw: content } };
     if (file_path && line) body.inline = { path: file_path, to: line };
-    const data = await bbRequest('POST', `/repositories/${workspace}/${repo}/pullrequests/${pr_id}/comments`, body);
+    const data = await bbRequest('POST', `${repoPath(workspace, repo)}/pullrequests/${pr_id}/comments`, body);
     const type = file_path ? `inline at ${file_path}:${line}` : 'general';
     return { content: [{ type: 'text', text: `✓ Comment #${data.id} created (${type}).` }] };
   }
@@ -158,7 +164,7 @@ server.registerTool(
       try {
         const body = { content: { raw: c.content } };
         if (c.file_path && c.line) body.inline = { path: c.file_path, to: c.line };
-        const data = await bbRequest('POST', `/repositories/${workspace}/${repo}/pullrequests/${pr_id}/comments`, body);
+        const data = await bbRequest('POST', `${repoPath(workspace, repo)}/pullrequests/${pr_id}/comments`, body);
         const type = c.file_path ? `inline ${c.file_path}:${c.line}` : 'general';
         results.push(`✓ [${i + 1}/${comments.length}] #${data.id} (${type})`);
       } catch (e) {
@@ -185,13 +191,13 @@ server.registerTool(
     },
   },
   async ({ workspace, repo, pr_id, page, pagelen }) => {
-    const data = await bbRequest('GET', `/repositories/${workspace}/${repo}/pullrequests/${pr_id}/comments?page=${page}&pagelen=${pagelen}`);
+    const data = await bbRequest('GET', `${repoPath(workspace, repo)}/pullrequests/${pr_id}/comments?page=${page}&pagelen=${pagelen}`);
     if (!data.values?.length) {
       return { content: [{ type: 'text', text: 'No comments found on this PR.' }] };
     }
     const lines = [`${data.size} comment(s) total — page ${page}:\n`];
     for (const c of data.values) {
-      const author   = c.author?.display_name ?? 'unknown';
+      const author   = oneLine(c.author?.display_name ?? 'unknown');
       const type     = c.inline ? ` [inline ${c.inline.path}:${c.inline.to}]` : '';
       const preview  = c.content?.raw?.slice(0, 120).replace(/\n/g, ' ');
       const resolved = c.resolution ? ' ✓ resolved' : '';
@@ -215,14 +221,14 @@ server.registerTool(
     },
   },
   async ({ workspace, repo, pr_id, comment_id }) => {
-    const c = await bbRequest('GET', `/repositories/${workspace}/${repo}/pullrequests/${pr_id}/comments/${comment_id}`);
+    const c = await bbRequest('GET', `${repoPath(workspace, repo)}/pullrequests/${pr_id}/comments/${comment_id}`);
     const type     = c.inline ? `inline at ${c.inline.path}:${c.inline.to}` : 'general';
-    const resolved = c.resolution ? `\nResolved by: @${c.resolution.user?.display_name ?? '?'} (${c.resolution.date?.slice(0, 10)})` : '';
+    const resolved = c.resolution ? `\nResolved by: @${oneLine(c.resolution.user?.display_name ?? '?')} (${c.resolution.date?.slice(0, 10)})` : '';
     const parent   = c.parent ? `\nReply to: #${c.parent.id}` : '';
     return {
       content: [{
         type: 'text',
-        text: [`Comment #${c.id} (${type})`, `Author: @${c.author?.display_name} — ${c.created_on?.slice(0, 10)}`, resolved, parent, `\n${c.content?.raw}`].join('\n'),
+        text: [`Comment #${c.id} (${type})`, `Author: @${oneLine(c.author?.display_name)} —${c.created_on?.slice(0, 10)}`, resolved, parent, `\n${c.content?.raw}`].join('\n'),
       }],
     };
   }
@@ -242,7 +248,7 @@ server.registerTool(
     },
   },
   async ({ workspace, repo, pr_id, comment_id, new_content }) => {
-    const data = await bbRequest('PUT', `/repositories/${workspace}/${repo}/pullrequests/${pr_id}/comments/${comment_id}`, { content: { raw: new_content } });
+    const data = await bbRequest('PUT', `${repoPath(workspace, repo)}/pullrequests/${pr_id}/comments/${comment_id}`, { content: { raw: new_content } });
     return { content: [{ type: 'text', text: `✓ Comment #${data.id} updated.` }] };
   }
 );
@@ -260,7 +266,7 @@ server.registerTool(
     },
   },
   async ({ workspace, repo, pr_id, comment_id }) => {
-    await bbRequestRaw('DELETE', `/repositories/${workspace}/${repo}/pullrequests/${pr_id}/comments/${comment_id}`);
+    await bbRequestRaw('DELETE', `${repoPath(workspace, repo)}/pullrequests/${pr_id}/comments/${comment_id}`);
     return { content: [{ type: 'text', text: `✓ Comment #${comment_id} deleted.` }] };
   }
 );
@@ -279,7 +285,7 @@ server.registerTool(
     },
   },
   async ({ workspace, repo, pr_id, comment_id, content }) => {
-    const data = await bbRequest('POST', `/repositories/${workspace}/${repo}/pullrequests/${pr_id}/comments`, { content: { raw: content }, parent: { id: comment_id } });
+    const data = await bbRequest('POST', `${repoPath(workspace, repo)}/pullrequests/${pr_id}/comments`, { content: { raw: content }, parent: { id: comment_id } });
     return { content: [{ type: 'text', text: `✓ Reply #${data.id} created in thread of #${comment_id}.` }] };
   }
 );
@@ -297,7 +303,7 @@ server.registerTool(
     },
   },
   async ({ workspace, repo, pr_id, comment_id }) => {
-    await bbRequestRaw('POST', `/repositories/${workspace}/${repo}/pullrequests/${pr_id}/comments/${comment_id}/resolve`);
+    await bbRequestRaw('POST', `${repoPath(workspace, repo)}/pullrequests/${pr_id}/comments/${comment_id}/resolve`);
     return { content: [{ type: 'text', text: `✓ Comment #${comment_id} marked as resolved.` }] };
   }
 );
@@ -315,7 +321,7 @@ server.registerTool(
     },
   },
   async ({ workspace, repo, pr_id, comment_id }) => {
-    await bbRequestRaw('DELETE', `/repositories/${workspace}/${repo}/pullrequests/${pr_id}/comments/${comment_id}/resolve`);
+    await bbRequestRaw('DELETE', `${repoPath(workspace, repo)}/pullrequests/${pr_id}/comments/${comment_id}/resolve`);
     return { content: [{ type: 'text', text: `✓ Comment #${comment_id} reopened.` }] };
   }
 );
@@ -332,7 +338,7 @@ server.registerTool(
     },
   },
   async ({ workspace, repo, pr_id }) => {
-    const data = await bbRequest('POST', `/repositories/${workspace}/${repo}/pullrequests/${pr_id}/approve`);
+    const data = await bbRequest('POST', `${repoPath(workspace, repo)}/pullrequests/${pr_id}/approve`);
     return { content: [{ type: 'text', text: `✓ PR #${pr_id} approved by @${data.user?.display_name ?? 'you'}.` }] };
   }
 );
@@ -349,7 +355,7 @@ server.registerTool(
     },
   },
   async ({ workspace, repo, pr_id }) => {
-    await bbRequestRaw('DELETE', `/repositories/${workspace}/${repo}/pullrequests/${pr_id}/approve`);
+    await bbRequestRaw('DELETE', `${repoPath(workspace, repo)}/pullrequests/${pr_id}/approve`);
     return { content: [{ type: 'text', text: `✓ Approval removed from PR #${pr_id}.` }] };
   }
 );
@@ -366,7 +372,7 @@ server.registerTool(
     },
   },
   async ({ workspace, repo, pr_id }) => {
-    const data = await bbRequest('POST', `/repositories/${workspace}/${repo}/pullrequests/${pr_id}/request-changes`);
+    const data = await bbRequest('POST', `${repoPath(workspace, repo)}/pullrequests/${pr_id}/request-changes`);
     return { content: [{ type: 'text', text: `✓ Changes requested on PR #${pr_id} by @${data.user?.display_name ?? 'you'}.` }] };
   }
 );
@@ -383,7 +389,7 @@ server.registerTool(
     },
   },
   async ({ workspace, repo, pr_id }) => {
-    await bbRequestRaw('DELETE', `/repositories/${workspace}/${repo}/pullrequests/${pr_id}/request-changes`);
+    await bbRequestRaw('DELETE', `${repoPath(workspace, repo)}/pullrequests/${pr_id}/request-changes`);
     return { content: [{ type: 'text', text: `✓ Changes request removed from PR #${pr_id}.` }] };
   }
 );
@@ -413,7 +419,7 @@ Note: you cannot approve or request changes on a PR you authored.`,
     },
   },
   async ({ workspace, repo, pr_id, verdict, comments, summary, delay_ms }) => {
-    const base = `/repositories/${workspace}/${repo}/pullrequests/${pr_id}`;
+    const base = `${repoPath(workspace, repo)}/pullrequests/${pr_id}`;
     const log = [];
     let failed = 0;
 
@@ -481,17 +487,17 @@ server.registerTool(
     },
   },
   async ({ workspace, repo, pr_id }) => {
-    const pr = await bbRequest('GET', `/repositories/${workspace}/${repo}/pullrequests/${pr_id}`);
+    const pr = await bbRequest('GET', `${repoPath(workspace, repo)}/pullrequests/${pr_id}`);
     const reviewers = (pr.participants ?? [])
       .filter(p => p.role === 'REVIEWER')
       .map(p => {
-        const name  = p.user?.display_name ?? '?';
+        const name  = oneLine(p.user?.display_name ?? '?');
         return `  ${REVIEW_MARKER[reviewStatusOf(p)]} — @${name}`;
       });
     const lines = [
-      `PR #${pr_id}: ${pr.title}`,
+      `PR #${pr_id}: ${oneLine(pr.title)}`,
       `State:    ${pr.state}`,
-      `Author:   @${pr.author?.display_name ?? '?'}`,
+      `Author:   @${oneLine(pr.author?.display_name ?? '?')}`,
       `Branch:   ${pr.source?.branch?.name} → ${pr.destination?.branch?.name}`,
       `Created:  ${pr.created_on?.slice(0, 10)}`,
       `Comments: ${pr.comment_count ?? 0}`,
@@ -536,7 +542,7 @@ server.registerTool(
     }
 
     const qs = new URLSearchParams({ q: buildPrQuery(state, rRef, aRef), sort, fields: PR_LIST_FIELDS, page: String(page), pagelen: String(pagelen) });
-    const data = await bbRequest('GET', `/repositories/${workspace}/${repo}/pullrequests?${qs}`);
+    const data = await bbRequest('GET', `${repoPath(workspace, repo)}/pullrequests?${qs}`);
 
     const values = data.values ?? [];
     const K = values.length;
@@ -562,9 +568,9 @@ server.registerTool(
     ];
     for (const pr of shown) {
       const draft = pr.draft ? ' [draft]' : '';
-      lines.push(`\n#${pr.id}${draft} ${pr.title} — @${pr.author?.display_name ?? '?'} — ${pr.state} — ${pr.source?.branch?.name ?? '?'} → ${pr.destination?.branch?.name ?? '?'} — updated ${pr.updated_on?.slice(0, 10) ?? '?'}`);
+      lines.push(`\n#${pr.id}${draft} ${oneLine(pr.title)} — @${oneLine(pr.author?.display_name ?? '?')} — ${pr.state} — ${oneLine(pr.source?.branch?.name ?? '?')} → ${oneLine(pr.destination?.branch?.name ?? '?')} — updated ${pr.updated_on?.slice(0, 10) ?? '?'}`);
       if (reviewer) lines.push(`  ${reviewer === 'me' ? 'you' : 'reviewer'}: ${REVIEW_MARKER[targetStatus(pr)]}`);
-      const reviewers = reviewersOf(pr).map(p => `${REVIEW_MARKER[reviewStatusOf(p)]} @${p.user?.display_name ?? '?'}`);
+      const reviewers = reviewersOf(pr).map(p => `${REVIEW_MARKER[reviewStatusOf(p)]} @${oneLine(p.user?.display_name ?? '?')}`);
       lines.push(`  reviewers: ${reviewers.length ? reviewers.join(' · ') : 'none assigned'}`);
     }
     // The review_status header already carries the pagination hint
