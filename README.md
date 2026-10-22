@@ -103,6 +103,14 @@ Alternatively, pass credentials directly in the config (no `.env` needed):
 
 Generate an API token at: <https://id.atlassian.com/manage-profile/security/api-tokens>
 
-Required scope: **Pull Requests → Write**
+Create it as an **API token with scopes**, app **Bitbucket**, with these scopes:
+
+| Scope                         | Used by                                                                        |
+| ----------------------------- | ------------------------------------------------------------------------------ |
+| `read:pullrequest:bitbucket`  | `list_prs`, `get_pr_status`, `list_pr_comments`, `get_pr_comment`             |
+| `write:pullrequest:bitbucket` | Comments (create/edit/delete/resolve), approvals, change requests, `submit_review` |
+| `read:user:bitbucket`         | `GET /user` to resolve `"me"` in `list_prs` (`reviewer`/`author`)              |
+
+No other scopes are needed (`read:workspace` and `read:repository` are not used).
 
 The `.env` file must never be committed to the repository (it is listed in `.gitignore`).
