@@ -143,3 +143,7 @@ Create it as an **API token with scopes**, app **Bitbucket**, with these scopes:
 No other scopes are needed (`read:workspace` and `read:repository` are not used).
 
 The `.env` file must never be committed to the repository (it is listed in `.gitignore`).
+
+## License
+
+[MIT](LICENSE)
