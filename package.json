@@ -5,10 +5,11 @@
     "description": "MCP server para gestionar comentarios en PRs de Bitbucket Cloud",
     "main": "index.js",
     "scripts": {
-      "start": "node index.js"
+      "start": "node index.js",
+      "test": "node --test"
     },
     "dependencies": {
-      "@modelcontextprotocol/sdk": "^1.0.0",
+      "@modelcontextprotocol/sdk": "^1.29.0",
       "dotenv": "^16.0.0",
       "zod": "^3.22.0"
     }
